@@ -2068,41 +2068,48 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return
             app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
             fingerprint = self._desired_command_sync_fingerprint()
-            skip_reason = self._command_sync_skip_reason(app_id, fingerprint)
-            if skip_reason:
-                logger.info("[%s] Skipping Discord slash command sync: %s", self.name, skip_reason)
-                return
-            self._record_command_sync_attempt(app_id, fingerprint)
-            http = getattr(self._client, "http", None)
-            has_ratelimit_timeout = http is not None and hasattr(http, "max_ratelimit_timeout")
-            previous_ratelimit_timeout = getattr(http, "max_ratelimit_timeout", None) if has_ratelimit_timeout else None
-            if has_ratelimit_timeout:
-                http.max_ratelimit_timeout = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
-            try:
-                # The command-management bucket is small and discord.py may sleep long on a 429: bound it.
-                summary = await asyncio.wait_for(self._safe_sync_slash_commands(), timeout=600)
-            except Exception as e:
-                if not self._is_discord_rate_limit(e):
-                    raise
-                retry_after = self._extract_discord_retry_after(e)
-                if retry_after is None:
-                    # Rate-limited with no retry-after: back off a conservative default.
-                    retry_after = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
-                self._record_command_sync_rate_limit(app_id, fingerprint, retry_after)
-                logger.warning(
-                    "[%s] Discord rate-limited slash command sync; retrying after %.0fs", self.name,
-                    retry_after,
+            client = self._client
+            while self._client is client and not self._disconnecting:
+                entry = self._read_command_sync_state().get(self._command_sync_state_key(app_id), {})
+                retry_until = float(entry.get("retry_after_until") or 0) if isinstance(entry, dict) else 0
+                if retry_until > time.time():
+                    await asyncio.sleep(retry_until - time.time() + 0.1)
+                    continue
+                skip_reason = self._command_sync_skip_reason(app_id, fingerprint)
+                if skip_reason:
+                    logger.info("[%s] Skipping Discord slash command sync: %s", self.name, skip_reason)
+                    return
+                self._record_command_sync_attempt(app_id, fingerprint)
+                http = getattr(client, "http", None)
+                has_ratelimit_timeout = http is not None and hasattr(http, "max_ratelimit_timeout")
+                previous_ratelimit_timeout = getattr(http, "max_ratelimit_timeout", None) if has_ratelimit_timeout else None
+                if has_ratelimit_timeout:
+                    http.max_ratelimit_timeout = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
+                try:
+                    # The command-management bucket is small and discord.py may sleep long on a 429: bound it.
+                    summary = await asyncio.wait_for(self._safe_sync_slash_commands(), timeout=600)
+                except Exception as e:
+                    if not self._is_discord_rate_limit(e):
+                        raise
+                    retry_after = self._extract_discord_retry_after(e)
+                    if retry_after is None:
+                        retry_after = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
+                    self._record_command_sync_rate_limit(app_id, fingerprint, retry_after)
+                    logger.warning(
+                        "[%s] Discord rate-limited slash command sync; retrying after %.0fs", self.name,
+                        retry_after,
+                    )
+                    continue
+                finally:
+                    if has_ratelimit_timeout:
+                        http.max_ratelimit_timeout = previous_ratelimit_timeout
+                self._record_command_sync_success(app_id, fingerprint, summary)
+                logger.info(
+                    "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
+                    self.name, summary["total"], summary["unchanged"], summary["updated"],
+                    summary["recreated"], summary["created"], summary["deleted"],
                 )
                 return
-            finally:
-                if has_ratelimit_timeout:
-                    http.max_ratelimit_timeout = previous_ratelimit_timeout
-            self._record_command_sync_success(app_id, fingerprint, summary)
-            logger.info(
-                "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
-                self.name, summary["total"], summary["unchanged"], summary["updated"],
-                summary["recreated"], summary["created"], summary["deleted"],
-            )
         except asyncio.TimeoutError:
             logger.warning(
                 "[%s] Slash command sync timed out — Discord rate-limit bucket "

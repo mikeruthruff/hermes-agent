@@ -485,6 +485,37 @@ async def test_safe_sync_slash_commands_only_mutates_diffs():
 
 
 @pytest.mark.asyncio
+async def test_post_connect_initialization_retries_rate_limit_without_reconnect(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    adapter._client = SimpleNamespace(
+        tree=SimpleNamespace(get_commands=lambda: []),
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+
+    class RateLimited(Exception):
+        retry_after = 1
+
+    summary = {"total": 0, "unchanged": 0, "updated": 0, "recreated": 0, "created": 0, "deleted": 0}
+    sync = AsyncMock(side_effect=[RateLimited(), summary])
+    monkeypatch.setattr(adapter, "_safe_sync_slash_commands", sync)
+    now = [1000.0]
+    monkeypatch.setattr(discord_platform.time, "time", lambda: now[0])
+
+    async def advance_clock(delay):
+        now[0] += delay
+
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", advance_clock)
+    await adapter._run_post_connect_initialization()
+
+    assert sync.await_count == 2
+    state = adapter._read_command_sync_state()["999"]
+    assert state["summary"] == summary
+    assert state["last_success_at"] >= state["last_attempt_at"]
+
+
+@pytest.mark.asyncio
 async def test_post_connect_initialization_retries_fingerprint_after_timeout(tmp_path, monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
